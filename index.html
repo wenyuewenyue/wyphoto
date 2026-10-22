@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WyPhoto 小白P图 — 抠图、消除笔、一键美化</title>
+<meta name="description" content="免费在线P图工具：AI抠图、消除笔、证件照换底、一键美化、裁剪、加文字、马赛克、压缩。全部在浏览器本地处理，图片不上传。">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📸</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">📸 WyPhoto <span>小白P图</span></div>
+  <div class="top-actions">
+    <button id="btnOpenTop" class="btn btn-primary">打开图片</button>
+    <button id="btnUndo" class="btn" disabled>↩ 撤销</button>
+    <button id="btnRedo" class="btn" disabled>↪ 重做</button>
+    <button id="btnSample" class="btn">用示例图试试</button>
+  </div>
+</header>
+
+<section id="homeView" class="home">
+  <h1>想给图片做点啥？点一个就行</h1>
+  <p class="sub">不用学修图，不用注册。图片全程在你的浏览器里处理，不上传服务器，不花一分钱额度。</p>
+  <div class="cards">
+    <button class="card" data-tool="cutout"><span class="ic">✂️</span><b>AI 抠图</b><small>一键去掉背景，换底色 / 做证件照</small></button>
+    <button class="card" data-tool="eraser"><span class="ic">🧹</span><b>消除笔</b><small>涂掉路人、杂物、水印文字</small></button>
+    <button class="card" data-tool="beauty"><span class="ic">✨</span><b>一键美化</b><small>滤镜和调色，点一下出效果</small></button>
+    <button class="card" data-tool="crop"><span class="ic">📐</span><b>裁剪改尺寸</b><small>头像、小红书、抖音现成比例</small></button>
+    <button class="card" data-tool="text"><span class="ic">🔤</span><b>加文字 / 水印</b><small>给图片配字、防盗水印</small></button>
+    <button class="card" data-tool="mosaic"><span class="ic">🔲</span><b>马赛克打码</b><small>涂哪里，糊哪里</small></button>
+    <button class="card" data-tool="export"><span class="ic">💾</span><b>压缩 / 转格式</b><small>变小、转 JPG / PNG / WebP</small></button>
+  </div>
+  <div id="dropZone" class="dropzone">
+    <p>📥 把图片拖到这里，或者</p>
+    <button id="btnPick" class="btn btn-primary btn-big">选择一张图片</button>
+    <p class="hint">支持 JPG / PNG / WebP，也可以直接 Ctrl+V 粘贴截图</p>
+  </div>
+</section>
+
+<main id="editorView" class="editor hidden">
+  <div class="canvas-wrap">
+    <div class="canvas-box" id="canvasBox">
+      <canvas id="canvas"></canvas>
+      <canvas id="overlay" class="hidden"></canvas>
+    </div>
+    <div class="canvas-info"><span id="imgInfo">未加载图片</span><span id="status" class="status"></span></div>
+  </div>
+
+  <aside class="panel">
+    <nav class="tabs">
+      <button class="tab active" data-tab="cutout">✂️ 抠图</button>
+      <button class="tab" data-tab="eraser">🧹 消除</button>
+      <button class="tab" data-tab="beauty">✨ 美化</button>
+      <button class="tab" data-tab="crop">📐 裁剪</button>
+      <button class="tab" data-tab="text">🔤 文字</button>
+      <button class="tab" data-tab="mosaic">🔲 马赛克</button>
+      <button class="tab" data-tab="export">💾 导出</button>
+    </nav>
+
+    <section class="pane active" id="pane-cutout">
+      <h3>AI 一键抠图</h3>
+      <p class="tip">第一次用会下载约 40MB 模型到浏览器，之后就快了，全程不耗额度。</p>
+      <button id="btnCutout" class="btn btn-primary btn-block">开始抠图</button>
+      <div id="cutoutProgress" class="progress hidden"><div class="bar"></div><span class="txt">准备中…</span></div>
+      <h4>抠完换个背景</h4>
+      <div class="row wrap">
+        <button class="btn chip bg-opt" data-bg="transparent">透明</button>
+        <button class="btn chip bg-opt" data-bg="#ffffff">白底</button>
+        <button class="btn chip bg-opt" data-bg="#438edb">蓝底</button>
+        <button class="btn chip bg-opt" data-bg="#ff0000">红底</button>
+        <label class="btn chip">自选 <input type="color" id="bgColor" value="#7ed957"></label>
+        <button class="btn chip" id="btnBgImage">用图片做背景</button>
+      </div>
+      <h4>做证件照（先抠图换底，再点这里）</h4>
+      <div class="row wrap">
+        <button class="btn chip id-photo" data-w="295" data-h="413">一寸 295×413</button>
+        <button class="btn chip id-photo" data-w="413" data-h="579">二寸 413×579</button>
+      </div>
+    </section>
+
+    <section class="pane" id="pane-eraser">
+      <h3>消除笔</h3>
+      <p class="tip">用手指/鼠标把不要的东西涂红，再点「开始消除」。适合路人、电线、污点、文字等小块区域；涂的面积越大越容易糊。</p>
+      <label class="slider-row">画笔粗细 <input type="range" id="eraserSize" min="8" max="120" value="40"><span id="eraserSizeVal">40</span></label>
+      <div class="row">
+        <button id="btnEraserClear" class="btn">清除涂抹</button>
+        <button id="btnEraserGo" class="btn btn-primary">开始消除</button>
+      </div>
+      <p class="tip" id="eraserStatus"></p>
+    </section>
+
+    <section class="pane" id="pane-beauty">
+      <h3>一键美化</h3>
+      <button id="btnAutoBeauty" class="btn btn-primary btn-block">✨ 一键美化（自动调亮调色）</button>
+      <h4>滤镜预设（点一下就生效，可撤销）</h4>
+      <div class="row wrap" id="filterPresets">
+        <button class="btn chip" data-filter="brightness(1.08) saturate(1.25) contrast(1.05)">清新</button>
+        <button class="btn chip" data-filter="sepia(.35) saturate(1.2) brightness(1.05)">暖阳</button>
+        <button class="btn chip" data-filter="saturate(1.45) contrast(1.12)">美食</button>
+        <button class="btn chip" data-filter="grayscale(1)">黑白</button>
+        <button class="btn chip" data-filter="sepia(.55) contrast(.95) brightness(1.02)">复古</button>
+        <button class="btn chip" data-filter="saturate(1.3) hue-rotate(-8deg) brightness(1.03)">风景</button>
+        <button class="btn chip" data-filter="blur(2px)">柔焦 2px</button>
+      </div>
+      <h4>手动微调（调好后点应用）</h4>
+      <label class="slider-row">亮度 <input type="range" id="adjBright" min="50" max="150" value="100"><span>100</span></label>
+      <label class="slider-row">对比 <input type="range" id="adjContrast" min="50" max="150" value="100"><span>100</span></label>
+      <label class="slider-row">饱和 <input type="range" id="adjSat" min="0" max="200" value="100"><span>100</span></label>
+      <button id="btnAdjApply" class="btn btn-block">应用调整</button>
+    </section>
+
+    <section class="pane" id="pane-crop">
+      <h3>按比例裁剪（居中裁）</h3>
+      <div class="row wrap">
+        <button class="btn chip ratio" data-r="1">1:1 头像</button>
+        <button class="btn chip ratio" data-r="0.75">3:4 小红书</button>
+        <button class="btn chip ratio" data-r="1.3333">4:3</button>
+        <button class="btn chip ratio" data-r="1.7778">16:9 封面</button>
+        <button class="btn chip ratio" data-r="0.5625">9:16 抖音</button>
+      </div>
+      <h4>旋转 / 翻转</h4>
+      <div class="row wrap">
+        <button class="btn chip" id="btnRotL">⟲ 左转90°</button>
+        <button class="btn chip" id="btnRotR">⟳ 右转90°</button>
+        <button class="btn chip" id="btnFlipH">↔ 左右翻</button>
+        <button class="btn chip" id="btnFlipV">↕ 上下翻</button>
+      </div>
+      <h4>改尺寸</h4>
+      <div class="row">
+        <input type="number" id="resizeW" placeholder="新宽度(px)" min="16" max="8000">
+        <button id="btnResize" class="btn">按宽度缩放</button>
+      </div>
+    </section>
+
+    <section class="pane" id="pane-text">
+      <h3>加文字</h3>
+      <input type="text" id="textInput" placeholder="输入要加的文字" class="text-input">
+      <label class="slider-row">字号 <input type="range" id="textSize" min="16" max="200" value="64"><span>64</span></label>
+      <div class="row">
+        <label>颜色 <input type="color" id="textColor" value="#ffffff"></label>
+        <select id="textPos">
+          <option value="bottom">底部居中</option>
+          <option value="top">顶部居中</option>
+          <option value="center">正中间</option>
+          <option value="br">右下角</option>
+        </select>
+      </div>
+      <button id="btnAddText" class="btn btn-primary btn-block">把文字加到图上</button>
+      <h4>加水印</h4>
+      <button id="btnWatermark" class="btn btn-block">用上面的文字加半透明水印（右下角）</button>
+    </section>
+
+    <section class="pane" id="pane-mosaic">
+      <h3>马赛克打码</h3>
+      <p class="tip">点「开始打码」后，直接在图上涂抹要遮住的地方（车牌、人脸、聊天记录…），涂完点「完成」。</p>
+      <label class="slider-row">画笔粗细 <input type="range" id="mosaicSize" min="16" max="160" value="60"><span>60</span></label>
+      <button id="btnMosaicToggle" class="btn btn-primary btn-block">开始打码</button>
+    </section>
+
+    <section class="pane" id="pane-export">
+      <h3>保存 / 导出</h3>
+      <label class="row">格式
+        <select id="expFormat">
+          <option value="image/png">PNG（透明/无损）</option>
+          <option value="image/jpeg" selected>JPG（体积小）</option>
+          <option value="image/webp">WebP（更小）</option>
+        </select>
+      </label>
+      <label class="slider-row">画质 <input type="range" id="expQuality" min="30" max="100" value="85"><span>85</span></label>
+      <p class="tip" id="expInfo">—</p>
+      <button id="btnDownload" class="btn btn-primary btn-block btn-big">⬇ 下载图片</button>
+      <button id="btnBackHome" class="btn btn-block">换一张图</button>
+    </section>
+  </aside>
+</main>
+
+<footer class="foot">WyPhoto · 全部处理都在你的浏览器本地完成，图片不会上传到任何服务器 · 抠图/消除模型首次使用时下载一次，之后不限次数、零额度</footer>
+
+<input type="file" id="fileInput" accept="image/*" class="hidden">
+<input type="file" id="bgFileInput" accept="image/*" class="hidden">
+<script src="app.js"></script>
+</body>
+</html>
