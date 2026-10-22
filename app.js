@@ -259,39 +259,147 @@ function loadOpenCV() {
   });
   return window.__cvReady;
 }
+/* 消除笔：优先本地 AI 模型 MI-GAN（ONNX，模型 MIT 许可），失败时兜底 OpenCV 修复。
+   实现为独立编写（clean-room），仅依据公开的模型张量规格：输入 image/mask 均为 uint8，
+   image 为 [1,3,H,W] 原始 0-255 无归一化，mask 为 [1,1,H,W] 且 0=要消除、255=保留；
+   模型内部会按 mask 包围盒裁剪到 512 处理再贴回原图。 */
+const MIGAN_URL = 'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx';
+let miganSession = null;
+function idbGet(key) {
+  return new Promise(res => {
+    try {
+      const rq = indexedDB.open('wyphoto-models', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('files');
+      rq.onerror = () => res(null);
+      rq.onsuccess = () => {
+        try {
+          const tx = rq.result.transaction('files').objectStore('files').get(key);
+          tx.onsuccess = () => res(tx.result || null); tx.onerror = () => res(null);
+        } catch (e) { res(null); }
+      };
+    } catch (e) { res(null); }
+  });
+}
+function idbPut(key, val) {
+  try {
+    const rq = indexedDB.open('wyphoto-models', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('files');
+    rq.onsuccess = () => { try { rq.result.transaction('files', 'readwrite').objectStore('files').put(val, key); } catch (e) {} };
+  } catch (e) {}
+}
+function loadOrt() {
+  if (window.__ortReady) return window.__ortReady;
+  window.__ortReady = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.wasm.min.js';
+    s.onload = () => {
+      if (!window.ort) { reject(new Error('ort missing')); return; }
+      window.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/';
+      resolve(window.ort);
+    };
+    s.onerror = () => reject(new Error('ort download failed'));
+    document.head.appendChild(s);
+  });
+  return window.__ortReady;
+}
+async function getMiganSession(st) {
+  if (miganSession) return miganSession;
+  const ort = await loadOrt();
+  let buf = await idbGet('migan_pipeline_v2');
+  if (!buf) {
+    st.textContent = '正在下载 AI 消除模型（约28MB，第一次才需要，之后会缓存）…';
+    const resp = await fetch(MIGAN_URL);
+    if (!resp.ok) throw new Error('model http ' + resp.status);
+    const total = +resp.headers.get('Content-Length') || 28079181;
+    if (resp.body && resp.body.getReader) {
+      const reader = resp.body.getReader(); const chunks = []; let got = 0;
+      for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; st.textContent = `正在下载 AI 消除模型… ${Math.round(got / total * 100)}%`; }
+      buf = new Uint8Array(got); let off = 0; for (const ch of chunks) { buf.set(ch, off); off += ch.length; }
+      buf = buf.buffer;
+    } else buf = await resp.arrayBuffer();
+    idbPut('migan_pipeline_v2', buf);
+  } else st.textContent = '已从缓存加载 AI 消除模型…';
+  miganSession = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+  return miganSession;
+}
+function maskBBox() {
+  const md = mctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
+  let minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
+  for (let y = 0; y < maskCanvas.height; y += 4) for (let x = 0; x < maskCanvas.width; x += 4) {
+    if (md[(y * maskCanvas.width + x) * 4] > 10) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  }
+  return maxX < 0 ? null : { minX, minY, maxX, maxY };
+}
+function cropRegion(box, pad) {
+  const x0 = Math.max(0, box.minX - pad), y0 = Math.max(0, box.minY - pad);
+  const x1 = Math.min(canvas.width - 1, box.maxX + pad), y1 = Math.min(canvas.height - 1, box.maxY + pad);
+  const w = x1 - x0 + 1, h = y1 - y0 + 1;
+  const img = document.createElement('canvas'); img.width = w; img.height = h;
+  img.getContext('2d').drawImage(canvas, x0, y0, w, h, 0, 0, w, h);
+  const msk = document.createElement('canvas'); msk.width = w; msk.height = h;
+  msk.getContext('2d').drawImage(maskCanvas, x0, y0, w, h, 0, 0, w, h);
+  return { img, msk, x0, y0, w, h };
+}
+async function miganInpaint(box, st) {
+  const ort = window.ort;
+  const session = await getMiganSession(st);
+  const pad = Math.max(96, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.6));
+  const { img, msk, x0, y0, w, h } = cropRegion(box, pad);
+  const idata = img.getContext('2d').getImageData(0, 0, w, h).data;
+  const mdata = msk.getContext('2d').getImageData(0, 0, w, h).data;
+  const imgT = new Uint8Array(w * h * 3), mskT = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < idata.length; i += 4, j++) {
+    imgT[j] = idata[i]; imgT[j + w * h] = idata[i + 1]; imgT[j + 2 * w * h] = idata[i + 2];
+    mskT[j] = mdata[i] > 10 ? 0 : 255;
+  }
+  st.textContent = 'AI 正在消除并补背景…';
+  await new Promise(r => setTimeout(r, 30));
+  const feeds = {};
+  feeds[session.inputNames[0]] = new ort.Tensor('uint8', imgT, [1, 3, h, w]);
+  feeds[session.inputNames[1]] = new ort.Tensor('uint8', mskT, [1, 1, h, w]);
+  const out = await session.run(feeds);
+  const res = out[session.outputNames[0]];
+  const rd = res.data, oimg = new ImageData(w, h);
+  for (let i = 0, j = 0; i < oimg.data.length; i += 4, j++) {
+    oimg.data[i] = rd[j]; oimg.data[i + 1] = rd[j + w * h]; oimg.data[i + 2] = rd[j + 2 * w * h]; oimg.data[i + 3] = 255;
+  }
+  const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
+  oc.getContext('2d').putImageData(oimg, 0, 0);
+  pushHistory(); ctx.drawImage(oc, x0, y0);
+}
+async function opencvInpaint(box, st) {
+  const cv = await loadOpenCV();
+  const pad = Math.max(48, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.45));
+  const { img, msk, x0, y0 } = cropRegion(box, pad);
+  const src = cv.imread(img), mk = cv.imread(msk), gray = new cv.Mat(), dst = new cv.Mat();
+  cv.cvtColor(mk, gray, cv.COLOR_RGBA2GRAY, 0); cv.threshold(gray, gray, 10, 255, cv.THRESH_BINARY);
+  cv.inpaint(src, gray, dst, 5, cv.INPAINT_TELEA);
+  const out = document.createElement('canvas'); cv.imshow(out, dst);
+  src.delete(); mk.delete(); gray.delete(); dst.delete();
+  pushHistory(); ctx.drawImage(out, x0, y0);
+}
 $('#btnEraserGo').onclick = async () => {
   if (!hasImage) return;
-  const st = $('#eraserStatus'); st.textContent = '正在加载消除引擎（第一次约需几秒）…';
+  const st = $('#eraserStatus');
+  const box = maskBBox();
+  if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
   try {
-    const cv = await loadOpenCV();
-    const md = mctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
-    let minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
-    for (let y = 0; y < maskCanvas.height; y += 4) for (let x = 0; x < maskCanvas.width; x += 4) {
-      if (md[(y * maskCanvas.width + x) * 4] > 10) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
-    }
-    if (maxX < 0) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
-    const pad = Math.max(48, Math.round(Math.max(maxX - minX, maxY - minY) * 0.45));
-    minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
-    maxX = Math.min(canvas.width - 1, maxX + pad); maxY = Math.min(canvas.height - 1, maxY + pad);
-    const rw = maxX - minX + 1, rh = maxY - minY + 1;
-    const region = document.createElement('canvas'); region.width = rw; region.height = rh;
-    region.getContext('2d').drawImage(canvas, minX, minY, rw, rh, 0, 0, rw, rh);
-    const rmask = document.createElement('canvas'); rmask.width = rw; rmask.height = rh;
-    rmask.getContext('2d').drawImage(maskCanvas, minX, minY, rw, rh, 0, 0, rw, rh);
-    st.textContent = '正在消除…';
-    await new Promise(r => setTimeout(r, 30));
-    const src = cv.imread(region), mk = cv.imread(rmask), gray = new cv.Mat(), dst = new cv.Mat();
-    cv.cvtColor(mk, gray, cv.COLOR_RGBA2GRAY, 0); cv.threshold(gray, gray, 10, 255, cv.THRESH_BINARY);
-    cv.inpaint(src, gray, dst, 5, cv.INPAINT_TELEA);
-    const out = document.createElement('canvas'); cv.imshow(out, dst);
-    src.delete(); mk.delete(); gray.delete(); dst.delete();
-    pushHistory(); ctx.drawImage(out, minX, minY);
+    await miganInpaint(box, st);
     setupMask(); afterChange();
-    st.textContent = '消除完成！不满意可以撤销后换个涂法再试。';
-    setStatus('消除完成');
+    st.textContent = 'AI 消除完成！不满意可以撤销后换个涂法再试。';
+    setStatus('AI 消除完成');
   } catch (err) {
-    console.error(err);
-    st.textContent = '消除失败：引擎没加载下来（在国外CDN）或图片太大。检查网络后重试。';
+    console.error('MI-GAN failed, fallback to OpenCV', err);
+    st.textContent = 'AI 模型没跑起来（多半是模型下载的网络问题），正在用基础修复试试…';
+    try {
+      await opencvInpaint(box, st);
+      setupMask(); afterChange();
+      st.textContent = '已用基础修复消除（AI 模型这次没下载下来，联网好时再点一次会用 AI 版）。';
+      setStatus('消除完成（基础修复）');
+    } catch (err2) {
+      console.error(err2);
+      st.textContent = '消除失败：两个引擎都没加载下来。检查网络后重试。';
+    }
   }
 };
 
