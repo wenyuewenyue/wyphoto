@@ -243,6 +243,13 @@ overlay.addEventListener('pointerdown', e => { if (!erasing) return; maskDrawing
 overlay.addEventListener('pointermove', e => { if (!erasing || !maskDrawing) return; strokeTo(canvasPos(e, overlay)); });
 window.addEventListener('pointerup', () => { maskDrawing = false; lastPt = null; });
 $('#btnEraserClear').onclick = () => { setupMask(); setStatus('涂抹已清除'); };
+function stageTicker(st, label) {
+  const t0 = Date.now();
+  const f = () => { const t = `${label}…已用时 ${Math.round((Date.now() - t0) / 1000)} 秒`; st.textContent = t; setStatus(t); };
+  f();
+  const id = setInterval(f, 1000);
+  return () => clearInterval(id);
+}
 const OPENCV_URLS = [
   'https://files.2221314.xyz/opencv.js',
   'https://docs.opencv.org/4.8.0/opencv.js'
@@ -263,7 +270,7 @@ function loadCvFrom(url) {
   return new Promise((resolve, reject) => {
     let done = false;
     const finish = (fn, v) => { if (!done) { done = true; clearTimeout(to); fn(v); } };
-    const to = setTimeout(() => finish(reject, new Error('opencv load timeout')), 60000);
+    const to = setTimeout(() => finish(reject, new Error('opencv load timeout')), 35000);
     const s = document.createElement('script');
     s.src = url;
     s.onload = () => {
@@ -294,7 +301,7 @@ const MIGAN_URLS = [
   'https://hf-mirror.com/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx',
   'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx'
 ];
-let miganWorker = null, miganReady = false, eraserBusy = false;
+let miganWorker = null, miganReady = false, fastBusy = false, aiBusy = false;
 function idbGet(key) {
   return new Promise(res => {
     try {
@@ -358,6 +365,8 @@ async function ensureMiganWorker(st) {
   if (miganWorker) { try { miganWorker.terminate(); } catch (e) {} miganWorker = null; }
   miganWorker = new Worker('migan-worker.js');
   miganReady = false;
+  const stopTick = stageTicker(st, '正在启动 AI 消除引擎');
+  try {
   await new Promise((resolve, reject) => {
     const to = setTimeout(() => reject(new Error('worker init timeout')), 120000);
     miganWorker.onmessage = (e) => {
@@ -367,11 +376,12 @@ async function ensureMiganWorker(st) {
     miganWorker.onerror = () => { clearTimeout(to); reject(new Error('worker failed to start')); };
     miganWorker.postMessage({ type: 'init', model: buf });
   });
+  } finally { stopTick(); }
 }
 function miganRun(imgT, mskT, w, h, st) {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
-    const tick = () => { st.textContent = `AI 正在消除并补背景…已用时 ${Math.round((Date.now() - t0) / 1000)} 秒（在后台算，页面可以正常操作）`; };
+    const tick = () => { const t = `AI 正在消除并补背景…已用时 ${Math.round((Date.now() - t0) / 1000)} 秒（在后台算，页面可以正常操作）`; st.textContent = t; setStatus(t); };
     tick();
     const timer = setInterval(tick, 1000);
     const to = setTimeout(() => {
@@ -442,36 +452,50 @@ async function miganInpaint(box, st) {
 async function opencvInpaint(box, st) {
   const cv = await loadOpenCV();
   const pad = Math.max(48, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.45));
-  const { img, msk, x0, y0 } = cropRegion(box, pad);
+  let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
+  let ow = w, oh = h;
+  const CVMAX = 1000;
+  if (Math.max(w, h) > CVMAX) {
+    const f = CVMAX / Math.max(w, h); ow = w; oh = h; w = Math.round(w * f); h = Math.round(h * f);
+    const si = document.createElement('canvas'); si.width = w; si.height = h; si.getContext('2d').drawImage(img, 0, 0, w, h);
+    const sm = document.createElement('canvas'); sm.width = w; sm.height = h; sm.getContext('2d').drawImage(msk, 0, 0, w, h);
+    img = si; msk = sm;
+  }
   const src = cv.imread(img), mk = cv.imread(msk), gray = new cv.Mat(), dst = new cv.Mat();
   cv.cvtColor(mk, gray, cv.COLOR_RGBA2GRAY, 0); cv.threshold(gray, gray, 10, 255, cv.THRESH_BINARY);
   cv.inpaint(src, gray, dst, 5, cv.INPAINT_TELEA);
   const out = document.createElement('canvas'); cv.imshow(out, dst);
   src.delete(); mk.delete(); gray.delete(); dst.delete();
-  pushHistory(); ctx.drawImage(out, x0, y0);
+  pushHistory(); ctx.drawImage(out, x0, y0, ow, oh);
 }
 $('#btnEraserFast').onclick = async () => {
-  if (!hasImage || eraserBusy) return;
+  if (!hasImage || fastBusy) return;
   const st = $('#eraserStatus');
+  if (aiBusy) { st.textContent = 'AI 强力消除正在进行，等它完成（或超时自动结束）后再点快速消除。'; return; }
   const box = maskBBox();
   if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
-  eraserBusy = true;
-  st.textContent = '正在加载快速消除引擎（第一次约10MB，之后秒开）…';
-  setStatus('正在加载快速消除引擎…');
+  fastBusy = true;
+  const stopTick = stageTicker(st, '正在加载快速消除引擎（第一次约10MB，之后秒开）');
   try {
+    await loadOpenCV();
+    stopTick();
+    st.textContent = '引擎就绪，正在修复…'; setStatus('快速消除：正在修复…');
+    await new Promise(r => setTimeout(r, 30));
     await opencvInpaint(box, st);
     setupMask(); afterChange();
     st.textContent = '快速消除完成！效果不满意可以撤销，再试「AI 强力消除」。';
     setStatus('快速消除完成');
   } catch (err) {
     console.error(err);
-    st.textContent = '快速消除没加载成功，检查网络后重试，或试「AI 强力消除」。';
-  } finally { eraserBusy = false; }
+    st.textContent = '快速消除没跑起来（引擎加载失败居多），检查网络后重试。';
+    setStatus('快速消除失败');
+  } finally { stopTick(); fastBusy = false; }
 };
 $('#btnEraserGo').onclick = async () => {
-  if (!hasImage || eraserBusy) return;
-  eraserBusy = true;
-  try { await runEraser(); } finally { eraserBusy = false; }
+  if (!hasImage || aiBusy) return;
+  if (fastBusy) { $('#eraserStatus').textContent = '快速消除正在进行，等它完成后再点 AI 强力消除。'; return; }
+  aiBusy = true;
+  try { await runEraser(); } finally { aiBusy = false; }
 };
 async function runEraser() {
   const st = $('#eraserStatus');

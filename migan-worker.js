@@ -4,8 +4,8 @@
    this adapter is written from the model's public tensor spec:
    inputs  image uint8 [1,3,H,W] raw 0-255, mask uint8 [1,1,H,W] (0=inpaint, 255=keep)
    output  uint8 [1,3,H,W]. */
-importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.wasm.min.js');
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/';
+importScripts('https://files.2221314.xyz/ort.wasm.min.js');
+ort.env.wasm.wasmPaths = 'https://files.2221314.xyz/';
 ort.env.wasm.numThreads = 1;
 
 let session = null;
