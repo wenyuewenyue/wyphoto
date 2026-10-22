@@ -250,46 +250,38 @@ function stageTicker(st, label) {
   const id = setInterval(f, 1000);
   return () => clearInterval(id);
 }
-const OPENCV_URLS = [
-  'https://files.2221314.xyz/opencv.js',
-  'https://docs.opencv.org/4.8.0/opencv.js'
-];
-function loadOpenCV() {
-  if (window.__cvReady) return window.__cvReady;
-  window.__cvReady = (async () => {
-    let lastErr = null;
-    for (const url of OPENCV_URLS) {
-      try { return await loadCvFrom(url); } catch (e) { console.error('opencv load failed', url, e); lastErr = e; }
-    }
-    window.__cvReady = null;
-    throw lastErr || new Error('OpenCV 加载失败');
-  })();
-  return window.__cvReady;
-}
-function loadCvFrom(url) {
-  return new Promise((resolve, reject) => {
-    let done = false;
-    const finish = (fn, v) => { if (!done) { done = true; clearTimeout(to); fn(v); } };
-    const to = setTimeout(() => finish(reject, new Error('opencv load timeout')), 35000);
-    const s = document.createElement('script');
-    s.src = url;
-    s.onload = () => {
-      let polls = 0;
-      const check = () => {
-        if (done) return;
-        const c = window.cv;
-        if (c && typeof c.then === 'function') {
-          c.then(m => { window.cv = m; finish(resolve, m); }, e => finish(reject, e));
-          return;
-        }
-        if (c && c.Mat) { finish(resolve, c); return; }
-        if (++polls > 550) { finish(reject, new Error('opencv init timeout')); return; }
-        setTimeout(check, 100);
+let cvWorker = null, cvReady = false;
+async function ensureCvWorker(st) {
+  if (cvWorker && cvReady) return;
+  if (cvWorker) { try { cvWorker.terminate(); } catch (e) {} cvWorker = null; }
+  cvWorker = new Worker('opencv-worker.js');
+  cvReady = false;
+  const stopTick = stageTicker(st, '正在加载快速消除引擎（第一次约10MB，之后秒开）');
+  try {
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('cv worker init timeout')), 90000);
+      cvWorker.onmessage = (e) => {
+        if (e.data.type === 'ready') { clearTimeout(to); cvReady = true; resolve(); }
+        else if (e.data.type === 'error') { clearTimeout(to); reject(new Error(e.data.message)); }
       };
-      check();
+      cvWorker.onerror = () => { clearTimeout(to); reject(new Error('cv worker failed to start')); };
+      cvWorker.postMessage({ type: 'init' });
+    });
+  } finally { stopTick(); }
+}
+function cvRun(imgData, mskData, w, h) {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => {
+      if (cvWorker) { try { cvWorker.terminate(); } catch (e) {} }
+      cvWorker = null; cvReady = false;
+      reject(new Error('cv run timeout'));
+    }, 120000);
+    cvWorker.onmessage = (e) => {
+      if (e.data.type === 'result') { clearTimeout(to); resolve(new Uint8Array(e.data.data)); }
+      else if (e.data.type === 'error') { clearTimeout(to); reject(new Error(e.data.message)); }
     };
-    s.onerror = () => finish(reject, new Error('opencv download failed'));
-    document.head.appendChild(s);
+    cvWorker.onerror = () => { clearTimeout(to); reject(new Error('cv worker crashed')); };
+    cvWorker.postMessage({ type: 'run', img: imgData.data.buffer, msk: mskData.data.buffer, w, h }, [imgData.data.buffer, mskData.data.buffer]);
   });
 }
 /* 消除笔：优先本地 AI 模型 MI-GAN（ONNX，模型 MIT 许可），失败时兜底 OpenCV 修复。
@@ -450,7 +442,8 @@ async function miganInpaint(box, st) {
   ctx.drawImage(oc, x0, y0, ow, oh);
 }
 async function opencvInpaint(box, st) {
-  const cv = await loadOpenCV();
+  await ensureCvWorker(st);
+  st.textContent = '引擎就绪，正在修复…'; setStatus('快速消除：正在修复…');
   const pad = Math.max(48, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.45));
   let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
   let ow = w, oh = h;
@@ -461,12 +454,13 @@ async function opencvInpaint(box, st) {
     const sm = document.createElement('canvas'); sm.width = w; sm.height = h; sm.getContext('2d').drawImage(msk, 0, 0, w, h);
     img = si; msk = sm;
   }
-  const src = cv.imread(img), mk = cv.imread(msk), gray = new cv.Mat(), dst = new cv.Mat();
-  cv.cvtColor(mk, gray, cv.COLOR_RGBA2GRAY, 0); cv.threshold(gray, gray, 10, 255, cv.THRESH_BINARY);
-  cv.inpaint(src, gray, dst, 5, cv.INPAINT_TELEA);
-  const out = document.createElement('canvas'); cv.imshow(out, dst);
-  src.delete(); mk.delete(); gray.delete(); dst.delete();
-  pushHistory(); ctx.drawImage(out, x0, y0, ow, oh);
+  await new Promise(r => setTimeout(r, 30));
+  const imgData = img.getContext('2d').getImageData(0, 0, w, h);
+  const mskData = msk.getContext('2d').getImageData(0, 0, w, h);
+  const outData = await cvRun(imgData, mskData, w, h);
+  const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
+  oc.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(outData), w, h), 0, 0);
+  pushHistory(); ctx.drawImage(oc, x0, y0, ow, oh);
 }
 $('#btnEraserFast').onclick = async () => {
   if (!hasImage || fastBusy) return;
@@ -475,12 +469,7 @@ $('#btnEraserFast').onclick = async () => {
   const box = maskBBox();
   if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
   fastBusy = true;
-  const stopTick = stageTicker(st, '正在加载快速消除引擎（第一次约10MB，之后秒开）');
   try {
-    await loadOpenCV();
-    stopTick();
-    st.textContent = '引擎就绪，正在修复…'; setStatus('快速消除：正在修复…');
-    await new Promise(r => setTimeout(r, 30));
     await opencvInpaint(box, st);
     setupMask(); afterChange();
     st.textContent = '快速消除完成！效果不满意可以撤销，再试「AI 强力消除」。';
@@ -489,7 +478,7 @@ $('#btnEraserFast').onclick = async () => {
     console.error(err);
     st.textContent = '快速消除没跑起来（引擎加载失败居多），检查网络后重试。';
     setStatus('快速消除失败');
-  } finally { stopTick(); fastBusy = false; }
+  } finally { fastBusy = false; }
 };
 $('#btnEraserGo').onclick = async () => {
   if (!hasImage || aiBusy) return;
