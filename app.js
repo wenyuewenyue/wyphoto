@@ -243,21 +243,47 @@ overlay.addEventListener('pointerdown', e => { if (!erasing) return; maskDrawing
 overlay.addEventListener('pointermove', e => { if (!erasing || !maskDrawing) return; strokeTo(canvasPos(e, overlay)); });
 window.addEventListener('pointerup', () => { maskDrawing = false; lastPt = null; });
 $('#btnEraserClear').onclick = () => { setupMask(); setStatus('涂抹已清除'); };
+const OPENCV_URLS = [
+  'https://files.2221314.xyz/opencv.js',
+  'https://docs.opencv.org/4.8.0/opencv.js'
+];
 function loadOpenCV() {
   if (window.__cvReady) return window.__cvReady;
-  window.__cvReady = new Promise((resolve, reject) => {
+  window.__cvReady = (async () => {
+    let lastErr = null;
+    for (const url of OPENCV_URLS) {
+      try { return await loadCvFrom(url); } catch (e) { console.error('opencv load failed', url, e); lastErr = e; }
+    }
+    window.__cvReady = null;
+    throw lastErr || new Error('OpenCV 加载失败');
+  })();
+  return window.__cvReady;
+}
+function loadCvFrom(url) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn, v) => { if (!done) { done = true; clearTimeout(to); fn(v); } };
+    const to = setTimeout(() => finish(reject, new Error('opencv load timeout')), 60000);
     const s = document.createElement('script');
-    s.src = 'https://docs.opencv.org/4.8.0/opencv.js';
+    s.src = url;
     s.onload = () => {
-      const cvObj = window.cv;
-      if (cvObj && typeof cvObj.then === 'function') cvObj.then(c => { window.cv = c; resolve(c); }, reject);
-      else if (cvObj) { cvObj.onRuntimeInitialized = () => resolve(cvObj); }
-      else reject(new Error('OpenCV 加载失败'));
+      let polls = 0;
+      const check = () => {
+        if (done) return;
+        const c = window.cv;
+        if (c && typeof c.then === 'function') {
+          c.then(m => { window.cv = m; finish(resolve, m); }, e => finish(reject, e));
+          return;
+        }
+        if (c && c.Mat) { finish(resolve, c); return; }
+        if (++polls > 550) { finish(reject, new Error('opencv init timeout')); return; }
+        setTimeout(check, 100);
+      };
+      check();
     };
-    s.onerror = () => reject(new Error('OpenCV 下载失败'));
+    s.onerror = () => finish(reject, new Error('opencv download failed'));
     document.head.appendChild(s);
   });
-  return window.__cvReady;
 }
 /* 消除笔：优先本地 AI 模型 MI-GAN（ONNX，模型 MIT 许可），失败时兜底 OpenCV 修复。
    实现为独立编写（clean-room），仅依据公开的模型张量规格：输入 image/mask 均为 uint8，
@@ -430,7 +456,8 @@ $('#btnEraserFast').onclick = async () => {
   const box = maskBBox();
   if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
   eraserBusy = true;
-  st.textContent = '正在快速消除…';
+  st.textContent = '正在加载快速消除引擎（第一次约10MB，之后秒开）…';
+  setStatus('正在加载快速消除引擎…');
   try {
     await opencvInpaint(box, st);
     setupMask(); afterChange();
