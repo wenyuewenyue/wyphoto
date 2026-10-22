@@ -81,11 +81,12 @@
 
     <section class="pane" id="pane-eraser">
       <h3>消除笔</h3>
-      <p class="tip">用手指/鼠标把不要的东西涂红，再点「开始消除」，AI 会把涂掉的地方补成背景。第一次用会下载约 28MB 模型到浏览器，之后不限次数、不耗额度。适合路人、电线、污点、文字、杂物。</p>
+      <p class="tip">用手指/鼠标把不要的东西涂红，再点消除。两个按钮任选：<b>快速消除</b>不用下载、马上出结果，适合水印文字、小杂物；<b>AI 强力消除</b>补背景更自然，第一次用要下载约 28MB 模型到浏览器（之后不限次数、不耗额度），计算要等一会儿。</p>
       <label class="slider-row">画笔粗细 <input type="range" id="eraserSize" min="8" max="120" value="40"><span id="eraserSizeVal">40</span></label>
       <div class="row">
         <button id="btnEraserClear" class="btn">清除涂抹</button>
-        <button id="btnEraserGo" class="btn btn-primary">开始消除</button>
+        <button id="btnEraserFast" class="btn btn-primary">快速消除</button>
+        <button id="btnEraserGo" class="btn">AI 强力消除</button>
       </div>
       <p class="tip" id="eraserStatus"></p>
     </section>

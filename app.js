@@ -424,6 +424,23 @@ async function opencvInpaint(box, st) {
   src.delete(); mk.delete(); gray.delete(); dst.delete();
   pushHistory(); ctx.drawImage(out, x0, y0);
 }
+$('#btnEraserFast').onclick = async () => {
+  if (!hasImage || eraserBusy) return;
+  const st = $('#eraserStatus');
+  const box = maskBBox();
+  if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
+  eraserBusy = true;
+  st.textContent = '正在快速消除…';
+  try {
+    await opencvInpaint(box, st);
+    setupMask(); afterChange();
+    st.textContent = '快速消除完成！效果不满意可以撤销，再试「AI 强力消除」。';
+    setStatus('快速消除完成');
+  } catch (err) {
+    console.error(err);
+    st.textContent = '快速消除没加载成功，检查网络后重试，或试「AI 强力消除」。';
+  } finally { eraserBusy = false; }
+};
 $('#btnEraserGo').onclick = async () => {
   if (!hasImage || eraserBusy) return;
   eraserBusy = true;
@@ -440,11 +457,11 @@ async function runEraser() {
     setStatus('AI 消除完成');
   } catch (err) {
     console.error('MI-GAN failed, fallback to OpenCV', err);
-    st.textContent = 'AI 消除没跑成，正在用基础修复试试…';
+    st.textContent = 'AI 消除没跑成，正在用快速修复试试…';
     try {
       await opencvInpaint(box, st);
       setupMask(); afterChange();
-      st.textContent = '已用基础修复消除（AI 版这次没跑起来，再点一次开始消除会重试 AI 版）。';
+      st.textContent = '已用快速修复消除（AI 版这次没跑起来，再点一次「AI 强力消除」会重试 AI 版）。';
       setStatus('消除完成（基础修复）');
     } catch (err2) {
       console.error(err2);
