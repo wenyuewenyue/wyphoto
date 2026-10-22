@@ -268,7 +268,7 @@ const MIGAN_URLS = [
   'https://hf-mirror.com/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx',
   'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx'
 ];
-let miganSession = null;
+let miganWorker = null, miganReady = false, eraserBusy = false;
 function idbGet(key) {
   return new Promise(res => {
     try {
@@ -290,22 +290,6 @@ function idbPut(key, val) {
     rq.onupgradeneeded = () => rq.result.createObjectStore('files');
     rq.onsuccess = () => { try { rq.result.transaction('files', 'readwrite').objectStore('files').put(val, key); } catch (e) {} };
   } catch (e) {}
-}
-function loadOrt() {
-  if (window.__ortReady) return window.__ortReady;
-  window.__ortReady = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.wasm.min.js';
-    s.onload = () => {
-      if (!window.ort) { reject(new Error('ort missing')); return; }
-      window.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/';
-      window.ort.env.wasm.numThreads = 1;
-      resolve(window.ort);
-    };
-    s.onerror = () => reject(new Error('ort download failed'));
-    document.head.appendChild(s);
-  });
-  return window.__ortReady;
 }
 async function fetchModelFrom(url, st) {
   const ctrl = new AbortController();
@@ -337,16 +321,47 @@ async function downloadMiganModel(st) {
   }
   throw lastErr || new Error('model download failed');
 }
-async function getMiganSession(st) {
-  if (miganSession) return miganSession;
-  const ort = await loadOrt();
+async function ensureMiganWorker(st) {
+  if (miganWorker && miganReady) return;
   let buf = await idbGet('migan_pipeline_v2');
   if (!buf) {
     buf = await downloadMiganModel(st);
     idbPut('migan_pipeline_v2', buf);
   } else st.textContent = '已从缓存加载 AI 消除模型…';
-  miganSession = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
-  return miganSession;
+  st.textContent = '正在启动 AI 消除引擎…';
+  if (miganWorker) { try { miganWorker.terminate(); } catch (e) {} miganWorker = null; }
+  miganWorker = new Worker('migan-worker.js');
+  miganReady = false;
+  await new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('worker init timeout')), 120000);
+    miganWorker.onmessage = (e) => {
+      if (e.data.type === 'ready') { clearTimeout(to); miganReady = true; resolve(); }
+      else if (e.data.type === 'error') { clearTimeout(to); reject(new Error(e.data.message)); }
+    };
+    miganWorker.onerror = () => { clearTimeout(to); reject(new Error('worker failed to start')); };
+    miganWorker.postMessage({ type: 'init', model: buf });
+  });
+}
+function miganRun(imgT, mskT, w, h, st) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => { st.textContent = `AI 正在消除并补背景…已用时 ${Math.round((Date.now() - t0) / 1000)} 秒（在后台算，页面可以正常操作）`; };
+    tick();
+    const timer = setInterval(tick, 1000);
+    const to = setTimeout(() => {
+      cleanup();
+      if (miganWorker) { try { miganWorker.terminate(); } catch (e) {} }
+      miganWorker = null; miganReady = false;
+      reject(new Error('migan run timeout'));
+    }, 240000);
+    function cleanup() { clearInterval(timer); clearTimeout(to); }
+    miganWorker.onmessage = (e) => {
+      if (e.data.type === 'result') { cleanup(); resolve(new Uint8Array(e.data.data)); }
+      else if (e.data.type === 'error') { cleanup(); reject(new Error(e.data.message)); }
+    };
+    miganWorker.onerror = () => { cleanup(); reject(new Error('worker crashed')); };
+    miganWorker.postMessage({ type: 'run', img: imgT.buffer, msk: mskT.buffer, w, h }, [imgT.buffer, mskT.buffer]);
+  });
 }
 function maskBBox() {
   const md = mctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
@@ -367,8 +382,7 @@ function cropRegion(box, pad) {
   return { img, msk, x0, y0, w, h };
 }
 async function miganInpaint(box, st) {
-  const ort = window.ort;
-  const session = await getMiganSession(st);
+  await ensureMiganWorker(st);
   const pad = Math.max(96, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.6));
   let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
   const MAXSIDE = 1280;
@@ -388,14 +402,8 @@ async function miganInpaint(box, st) {
     imgT[j] = idata[i]; imgT[j + w * h] = idata[i + 1]; imgT[j + 2 * w * h] = idata[i + 2];
     mskT[j] = mdata[i] > 10 ? 0 : 255;
   }
-  st.textContent = 'AI 正在消除并补背景…（手机上可能要等 10~60 秒，别切走）';
-  await new Promise(r => setTimeout(r, 30));
-  const feeds = {};
-  feeds[session.inputNames[0]] = new ort.Tensor('uint8', imgT, [1, 3, h, w]);
-  feeds[session.inputNames[1]] = new ort.Tensor('uint8', mskT, [1, 1, h, w]);
-  const out = await session.run(feeds);
-  const res = out[session.outputNames[0]];
-  const rd = res.data, oimg = new ImageData(w, h);
+  const rd = await miganRun(imgT, mskT, w, h, st);
+  const oimg = new ImageData(w, h);
   for (let i = 0, j = 0; i < oimg.data.length; i += 4, j++) {
     oimg.data[i] = rd[j]; oimg.data[i + 1] = rd[j + w * h]; oimg.data[i + 2] = rd[j + 2 * w * h]; oimg.data[i + 3] = 255;
   }
@@ -417,7 +425,11 @@ async function opencvInpaint(box, st) {
   pushHistory(); ctx.drawImage(out, x0, y0);
 }
 $('#btnEraserGo').onclick = async () => {
-  if (!hasImage) return;
+  if (!hasImage || eraserBusy) return;
+  eraserBusy = true;
+  try { await runEraser(); } finally { eraserBusy = false; }
+};
+async function runEraser() {
   const st = $('#eraserStatus');
   const box = maskBBox();
   if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
@@ -428,11 +440,11 @@ $('#btnEraserGo').onclick = async () => {
     setStatus('AI 消除完成');
   } catch (err) {
     console.error('MI-GAN failed, fallback to OpenCV', err);
-    st.textContent = 'AI 模型没跑起来（多半是模型下载的网络问题），正在用基础修复试试…';
+    st.textContent = 'AI 消除没跑成，正在用基础修复试试…';
     try {
       await opencvInpaint(box, st);
       setupMask(); afterChange();
-      st.textContent = '已用基础修复消除（AI 模型这次没下载下来，联网好时再点一次会用 AI 版）。';
+      st.textContent = '已用基础修复消除（AI 版这次没跑起来，再点一次开始消除会重试 AI 版）。';
       setStatus('消除完成（基础修复）');
     } catch (err2) {
       console.error(err2);
