@@ -263,7 +263,11 @@ function loadOpenCV() {
    实现为独立编写（clean-room），仅依据公开的模型张量规格：输入 image/mask 均为 uint8，
    image 为 [1,3,H,W] 原始 0-255 无归一化，mask 为 [1,1,H,W] 且 0=要消除、255=保留；
    模型内部会按 mask 包围盒裁剪到 512 处理再贴回原图。 */
-const MIGAN_URL = 'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx';
+const MIGAN_URLS = [
+  'https://files.2221314.xyz/migan_pipeline_v2.onnx',
+  'https://hf-mirror.com/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx',
+  'https://huggingface.co/andraniksargsyan/migan/resolve/main/migan_pipeline_v2.onnx'
+];
 let miganSession = null;
 function idbGet(key) {
   return new Promise(res => {
@@ -295,6 +299,7 @@ function loadOrt() {
     s.onload = () => {
       if (!window.ort) { reject(new Error('ort missing')); return; }
       window.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/';
+      window.ort.env.wasm.numThreads = 1;
       resolve(window.ort);
     };
     s.onerror = () => reject(new Error('ort download failed'));
@@ -302,21 +307,42 @@ function loadOrt() {
   });
   return window.__ortReady;
 }
+async function fetchModelFrom(url, st) {
+  const ctrl = new AbortController();
+  const resp = await fetch(url, { signal: ctrl.signal });
+  if (!resp.ok) throw new Error('model http ' + resp.status);
+  const total = +resp.headers.get('Content-Length') || 28079181;
+  if (!resp.body || !resp.body.getReader) return await resp.arrayBuffer();
+  const reader = resp.body.getReader(); const chunks = []; let got = 0;
+  for (;;) {
+    let timer;
+    const stall = new Promise((_, rej) => { timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} rej(new Error('download stalled')); }, 25000); });
+    let r;
+    try { r = await Promise.race([reader.read(), stall]); } finally { clearTimeout(timer); }
+    if (r.done) break;
+    chunks.push(r.value); got += r.value.length;
+    st.textContent = `正在下载 AI 消除模型… ${Math.round(got / total * 100)}%（下完自动继续，别切走）`;
+  }
+  const buf = new Uint8Array(got); let off = 0;
+  for (const ch of chunks) { buf.set(ch, off); off += ch.length; }
+  return buf.buffer;
+}
+async function downloadMiganModel(st) {
+  let lastErr = null;
+  for (let i = 0; i < MIGAN_URLS.length; i++) {
+    try {
+      st.textContent = i === 0 ? '正在下载 AI 消除模型（约28MB，第一次才需要，之后会缓存）…' : '第一个下载源卡住了，正在换备用源下载…';
+      return await fetchModelFrom(MIGAN_URLS[i], st);
+    } catch (e) { console.error('model download failed from', MIGAN_URLS[i], e); lastErr = e; }
+  }
+  throw lastErr || new Error('model download failed');
+}
 async function getMiganSession(st) {
   if (miganSession) return miganSession;
   const ort = await loadOrt();
   let buf = await idbGet('migan_pipeline_v2');
   if (!buf) {
-    st.textContent = '正在下载 AI 消除模型（约28MB，第一次才需要，之后会缓存）…';
-    const resp = await fetch(MIGAN_URL);
-    if (!resp.ok) throw new Error('model http ' + resp.status);
-    const total = +resp.headers.get('Content-Length') || 28079181;
-    if (resp.body && resp.body.getReader) {
-      const reader = resp.body.getReader(); const chunks = []; let got = 0;
-      for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; st.textContent = `正在下载 AI 消除模型… ${Math.round(got / total * 100)}%`; }
-      buf = new Uint8Array(got); let off = 0; for (const ch of chunks) { buf.set(ch, off); off += ch.length; }
-      buf = buf.buffer;
-    } else buf = await resp.arrayBuffer();
+    buf = await downloadMiganModel(st);
     idbPut('migan_pipeline_v2', buf);
   } else st.textContent = '已从缓存加载 AI 消除模型…';
   miganSession = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
@@ -344,7 +370,17 @@ async function miganInpaint(box, st) {
   const ort = window.ort;
   const session = await getMiganSession(st);
   const pad = Math.max(96, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.6));
-  const { img, msk, x0, y0, w, h } = cropRegion(box, pad);
+  let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
+  const MAXSIDE = 1280;
+  if (Math.max(w, h) > MAXSIDE) {
+    const f = MAXSIDE / Math.max(w, h), nw = Math.round(w * f), nh = Math.round(h * f);
+    const si = document.createElement('canvas'); si.width = nw; si.height = nh; si.getContext('2d').drawImage(img, 0, 0, nw, nh);
+    const sm = document.createElement('canvas'); sm.width = nw; sm.height = nh; sm.getContext('2d').drawImage(msk, 0, 0, nw, nh);
+    img = si; msk = sm;
+    // 结果画回原图时按原始区域尺寸绘制（见下方 drawImage 的目标宽高）
+    img.dataset.origW = w; img.dataset.origH = h;
+    w = nw; h = nh;
+  }
   const idata = img.getContext('2d').getImageData(0, 0, w, h).data;
   const mdata = msk.getContext('2d').getImageData(0, 0, w, h).data;
   const imgT = new Uint8Array(w * h * 3), mskT = new Uint8Array(w * h);
@@ -352,7 +388,7 @@ async function miganInpaint(box, st) {
     imgT[j] = idata[i]; imgT[j + w * h] = idata[i + 1]; imgT[j + 2 * w * h] = idata[i + 2];
     mskT[j] = mdata[i] > 10 ? 0 : 255;
   }
-  st.textContent = 'AI 正在消除并补背景…';
+  st.textContent = 'AI 正在消除并补背景…（手机上可能要等 10~60 秒，别切走）';
   await new Promise(r => setTimeout(r, 30));
   const feeds = {};
   feeds[session.inputNames[0]] = new ort.Tensor('uint8', imgT, [1, 3, h, w]);
@@ -365,7 +401,9 @@ async function miganInpaint(box, st) {
   }
   const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
   oc.getContext('2d').putImageData(oimg, 0, 0);
-  pushHistory(); ctx.drawImage(oc, x0, y0);
+  pushHistory();
+  const ow = +(img.dataset.origW || w), oh = +(img.dataset.origH || h);
+  ctx.drawImage(oc, x0, y0, ow, oh);
 }
 async function opencvInpaint(box, st) {
   const cv = await loadOpenCV();
