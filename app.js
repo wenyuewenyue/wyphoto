@@ -250,38 +250,21 @@ function stageTicker(st, label) {
   const id = setInterval(f, 1000);
   return () => clearInterval(id);
 }
-let cvWorker = null, cvReady = false;
-async function ensureCvWorker(st) {
-  if (cvWorker && cvReady) return;
-  if (cvWorker) { try { cvWorker.terminate(); } catch (e) {} cvWorker = null; }
-  cvWorker = new Worker('opencv-worker.js');
-  cvReady = false;
-  const stopTick = stageTicker(st, '正在加载快速消除引擎（第一次约10MB，之后秒开）');
-  try {
-    await new Promise((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error('cv worker init timeout')), 90000);
-      cvWorker.onmessage = (e) => {
-        if (e.data.type === 'ready') { clearTimeout(to); cvReady = true; resolve(); }
-        else if (e.data.type === 'error') { clearTimeout(to); reject(new Error(e.data.message)); }
-      };
-      cvWorker.onerror = () => { clearTimeout(to); reject(new Error('cv worker failed to start')); };
-      cvWorker.postMessage({ type: 'init' });
-    });
-  } finally { stopTick(); }
-}
-function cvRun(imgData, mskData, w, h) {
+let fastWorker = null;
+function fastRun(imgData, mskData, w, h) {
   return new Promise((resolve, reject) => {
+    if (!fastWorker) fastWorker = new Worker('fast-worker.js');
     const to = setTimeout(() => {
-      if (cvWorker) { try { cvWorker.terminate(); } catch (e) {} }
-      cvWorker = null; cvReady = false;
-      reject(new Error('cv run timeout'));
-    }, 120000);
-    cvWorker.onmessage = (e) => {
+      try { fastWorker.terminate(); } catch (e) {}
+      fastWorker = null;
+      reject(new Error('fast run timeout'));
+    }, 90000);
+    fastWorker.onmessage = (e) => {
       if (e.data.type === 'result') { clearTimeout(to); resolve(new Uint8Array(e.data.data)); }
       else if (e.data.type === 'error') { clearTimeout(to); reject(new Error(e.data.message)); }
     };
-    cvWorker.onerror = () => { clearTimeout(to); reject(new Error('cv worker crashed')); };
-    cvWorker.postMessage({ type: 'run', img: imgData.data.buffer, msk: mskData.data.buffer, w, h }, [imgData.data.buffer, mskData.data.buffer]);
+    fastWorker.onerror = () => { clearTimeout(to); reject(new Error('fast worker crashed')); };
+    fastWorker.postMessage({ type: 'run', img: imgData.data.buffer, msk: mskData.data.buffer, w, h }, [imgData.data.buffer, mskData.data.buffer]);
   });
 }
 /* 消除笔：优先本地 AI 模型 MI-GAN（ONNX，模型 MIT 许可），失败时兜底 OpenCV 修复。
@@ -441,26 +424,27 @@ async function miganInpaint(box, st) {
   const ow = +(img.dataset.origW || w), oh = +(img.dataset.origH || h);
   ctx.drawImage(oc, x0, y0, ow, oh);
 }
-async function opencvInpaint(box, st) {
-  await ensureCvWorker(st);
-  st.textContent = '引擎就绪，正在修复…'; setStatus('快速消除：正在修复…');
-  const pad = Math.max(48, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.45));
-  let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
-  let ow = w, oh = h;
-  const CVMAX = 1000;
-  if (Math.max(w, h) > CVMAX) {
-    const f = CVMAX / Math.max(w, h); ow = w; oh = h; w = Math.round(w * f); h = Math.round(h * f);
-    const si = document.createElement('canvas'); si.width = w; si.height = h; si.getContext('2d').drawImage(img, 0, 0, w, h);
-    const sm = document.createElement('canvas'); sm.width = w; sm.height = h; sm.getContext('2d').drawImage(msk, 0, 0, w, h);
-    img = si; msk = sm;
-  }
-  await new Promise(r => setTimeout(r, 30));
-  const imgData = img.getContext('2d').getImageData(0, 0, w, h);
-  const mskData = msk.getContext('2d').getImageData(0, 0, w, h);
-  const outData = await cvRun(imgData, mskData, w, h);
-  const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
-  oc.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(outData), w, h), 0, 0);
-  pushHistory(); ctx.drawImage(oc, x0, y0, ow, oh);
+async function fastInpaint(box, st) {
+  const stopTick = stageTicker(st, '正在快速消除');
+  try {
+    const pad = Math.max(48, Math.round(Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.45));
+    let { img, msk, x0, y0, w, h } = cropRegion(box, pad);
+    let ow = w, oh = h;
+    const CVMAX = 1000;
+    if (Math.max(w, h) > CVMAX) {
+      const f = CVMAX / Math.max(w, h); ow = w; oh = h; w = Math.round(w * f); h = Math.round(h * f);
+      const si = document.createElement('canvas'); si.width = w; si.height = h; si.getContext('2d').drawImage(img, 0, 0, w, h);
+      const sm = document.createElement('canvas'); sm.width = w; sm.height = h; sm.getContext('2d').drawImage(msk, 0, 0, w, h);
+      img = si; msk = sm;
+    }
+    await new Promise(r => setTimeout(r, 30));
+    const imgData = img.getContext('2d').getImageData(0, 0, w, h);
+    const mskData = msk.getContext('2d').getImageData(0, 0, w, h);
+    const outData = await fastRun(imgData, mskData, w, h);
+    const oc = document.createElement('canvas'); oc.width = w; oc.height = h;
+    oc.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(outData), w, h), 0, 0);
+    pushHistory(); ctx.drawImage(oc, x0, y0, ow, oh);
+  } finally { stopTick(); }
 }
 $('#btnEraserFast').onclick = async () => {
   if (!hasImage || fastBusy) return;
@@ -470,13 +454,13 @@ $('#btnEraserFast').onclick = async () => {
   if (!box) { st.textContent = '你还没涂呢 — 先在图上把不要的东西涂红。'; return; }
   fastBusy = true;
   try {
-    await opencvInpaint(box, st);
+    await fastInpaint(box, st);
     setupMask(); afterChange();
     st.textContent = '快速消除完成！效果不满意可以撤销，再试「AI 强力消除」。';
     setStatus('快速消除完成');
   } catch (err) {
     console.error(err);
-    st.textContent = '快速消除没跑起来（引擎加载失败居多），检查网络后重试。';
+    st.textContent = '快速消除没跑起来，再试一次，或用 AI 强力消除。';
     setStatus('快速消除失败');
   } finally { fastBusy = false; }
 };
@@ -499,13 +483,13 @@ async function runEraser() {
     console.error('MI-GAN failed, fallback to OpenCV', err);
     st.textContent = 'AI 消除没跑成，正在用快速修复试试…';
     try {
-      await opencvInpaint(box, st);
+      await fastInpaint(box, st);
       setupMask(); afterChange();
       st.textContent = '已用快速修复消除（AI 版这次没跑起来，再点一次「AI 强力消除」会重试 AI 版）。';
       setStatus('消除完成（基础修复）');
     } catch (err2) {
       console.error(err2);
-      st.textContent = '消除失败：两个引擎都没加载下来。检查网络后重试。';
+      st.textContent = '消除失败：两个办法都没跑起来。再试一次，或换个区域涂小一点试试。';
     }
   }
 };
